@@ -20,6 +20,7 @@ import (
 	"context"
 	"crypto/md5"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -102,7 +103,7 @@ func (in *instrumentedAlphaService) checkInitialized() error {
 	return errors.New("server is not initialized yet")
 }
 
-func writePodExtractpolicyLog(namespace string, podname string, entry string) error {
+func writePodExtractpolicyLog(namespace string, podname string, apiName string, request interface{}) error {
 	extractpolicyLogDir := "/var/log/extractpolicy"
 	logDir := filepath.Join(extractpolicyLogDir, namespace)
 	err := os.MkdirAll(logDir, 0777)
@@ -116,6 +117,12 @@ func writePodExtractpolicyLog(namespace string, podname string, entry string) er
 		return err
 	}
 	defer file.Close()
+
+	reqJsonByte, err := json.Marshal(request)
+	if err != nil {
+		return err
+	}
+	entry := fmt.Sprintf("%s:%s\n", apiName, string(reqJsonByte))
 
 	_, err = file.WriteString(entry)
 	if err != nil {
@@ -140,7 +147,7 @@ func calculateMD5Hash(input string) string {
 	return hex.EncodeToString(hashBytes)
 }
 
-func writeContainerExtractpolicyLog(containerID string, entry string) error {
+func writeContainerExtractpolicyLog(containerID string, apiName string, request interface{}) error {
 	namespace := containerIdToNamespace[containerID]
 	podname := ContainerIdToPodName[containerID]
 	containerSpecHash := ContainerIdToContaienerSpecHash[containerID]
@@ -157,6 +164,12 @@ func writeContainerExtractpolicyLog(containerID string, entry string) error {
 		return err
 	}
 	defer file.Close()
+
+	reqJsonByte, err := json.Marshal(request)
+	if err != nil {
+		return err
+	}
+	entry := fmt.Sprintf("%s:%s\n", apiName, string(reqJsonByte))
 
 	_, err = file.WriteString(entry)
 	if err != nil {
@@ -176,7 +189,7 @@ func (in *instrumentedService) RunPodSandbox(ctx context.Context, r *runtime.Run
 			log.G(ctx).WithError(err).Errorf("RunPodSandbox for %+v failed, error", r.GetConfig().GetMetadata())
 		} else {
 			log.G(ctx).Infof("RunPodSandbox for %+v returns sandbox id %q", r.GetConfig().GetMetadata(), res.GetPodSandboxId())
-			err = writePodExtractpolicyLog(r.GetConfig().GetMetadata().Namespace, r.GetConfig().GetMetadata().Name, fmt.Sprintf("%+v\n", r))
+			err = writePodExtractpolicyLog(r.GetConfig().GetMetadata().Namespace, r.GetConfig().GetMetadata().Name, "RunPodSandbox", r)
 			if err != nil {
 				log.G(ctx).Tracef("[extractpolicy][important][logerror]RunPodSandbox log failed: %s", err)
 			}
@@ -512,11 +525,11 @@ func (in *instrumentedService) CreateContainer(ctx context.Context, r *runtime.C
 			ContainerIdToPodName[res.GetContainerId()] = r.GetSandboxConfig().GetMetadata().Name
 			strContainerSpec := fmt.Sprintf("%+v", r.GetConfig())
 			ContainerIdToContaienerSpecHash[res.GetContainerId()] = calculateMD5Hash(strContainerSpec)
-			err = writePodExtractpolicyLog(r.GetSandboxConfig().GetMetadata().Namespace, r.GetSandboxConfig().GetMetadata().Name, fmt.Sprintf("%+v\n", r))
+			err = writePodExtractpolicyLog(r.GetSandboxConfig().GetMetadata().Namespace, r.GetSandboxConfig().GetMetadata().Name, "CreateContainer", r)
 			if err != nil {
 				log.G(ctx).Tracef("[extractpolicy][important][logerror]CreateContainer log failed (pod): %s", err)
 			}
-			err = writeContainerExtractpolicyLog(res.GetContainerId(), fmt.Sprintf("%+v\n", r))
+			err = writeContainerExtractpolicyLog(res.GetContainerId(), "CreateContainer", r)
 			if err != nil {
 				log.G(ctx).Tracef("[extractpolicy][important][logerror]CreateContainer log failed (container): %s", err)
 			}
@@ -578,7 +591,7 @@ func (in *instrumentedService) StartContainer(ctx context.Context, r *runtime.St
 			log.G(ctx).WithError(err).Errorf("StartContainer for %q failed", r.GetContainerId())
 		} else {
 			log.G(ctx).Infof("StartContainer for %q returns successfully", r.GetContainerId())
-			err = writeContainerExtractpolicyLog(r.GetContainerId(), fmt.Sprintf("%+v\n", r))
+			err = writeContainerExtractpolicyLog(r.GetContainerId(), "StartContainer", r)
 			if err != nil {
 				log.G(ctx).Tracef("[extractpolicy][important][logerror]StartContainer log failed: %s", err)
 			}
@@ -854,7 +867,7 @@ func (in *instrumentedService) ExecSync(ctx context.Context, r *runtime.ExecSync
 			log.G(ctx).WithError(err).Errorf("ExecSync for %q failed", r.GetContainerId())
 		} else {
 			log.G(ctx).Debugf("ExecSync for %q returns with exit code %d", r.GetContainerId(), res.GetExitCode())
-			err = writeContainerExtractpolicyLog(r.GetContainerId(), fmt.Sprintf("%+v\n", r))
+			err = writeContainerExtractpolicyLog(r.GetContainerId(), "ExecSync", r)
 			if err != nil {
 				log.G(ctx).Tracef("[extractpolicy][important][logerror]ExecSync log failed: %s", err)
 			}
@@ -913,7 +926,7 @@ func (in *instrumentedService) Exec(ctx context.Context, r *runtime.ExecRequest)
 			log.G(ctx).WithError(err).Errorf("Exec for %q failed", r.GetContainerId())
 		} else {
 			log.G(ctx).Debugf("Exec for %q returns URL %q", r.GetContainerId(), res.GetUrl())
-			err = writeContainerExtractpolicyLog(r.GetContainerId(), fmt.Sprintf("%+v\n", r))
+			err = writeContainerExtractpolicyLog(r.GetContainerId(), "Exec", r)
 			if err != nil {
 				log.G(ctx).Tracef("[extractpolicy][important][logerror]Exec log failed: %s", err)
 			}
@@ -972,7 +985,7 @@ func (in *instrumentedService) Attach(ctx context.Context, r *runtime.AttachRequ
 			log.G(ctx).WithError(err).Errorf("Attach for %q failed", r.GetContainerId())
 		} else {
 			log.G(ctx).Debugf("Attach for %q returns URL %q", r.GetContainerId(), res.Url)
-			err = writeContainerExtractpolicyLog(r.GetContainerId(), fmt.Sprintf("%+v\n", r))
+			err = writeContainerExtractpolicyLog(r.GetContainerId(), "Attach", r)
 			if err != nil {
 				log.G(ctx).Tracef("[extractpolicy][important][logerror]Attach log failed: %s", err)
 			}
@@ -1030,7 +1043,7 @@ func (in *instrumentedService) UpdateContainerResources(ctx context.Context, r *
 			log.G(ctx).WithError(err).Errorf("UpdateContainerResources for %q failed", r.GetContainerId())
 		} else {
 			log.G(ctx).Infof("UpdateContainerResources for %q returns successfully", r.GetContainerId())
-			err = writeContainerExtractpolicyLog(r.GetContainerId(), fmt.Sprintf("%+v\n", r))
+			err = writeContainerExtractpolicyLog(r.GetContainerId(), "UpdateContainerResources", r)
 			if err != nil {
 				log.G(ctx).Tracef("[extractpolicy][important][logerror]UpdateContainerResources log failed: %s", err)
 			}
@@ -1091,7 +1104,7 @@ func (in *instrumentedService) PullImage(ctx context.Context, r *runtime.PullIma
 		} else {
 			log.G(ctx).Infof("PullImage %q returns image reference %q",
 				r.GetImage().GetImage(), res.GetImageRef())
-			err = writePodExtractpolicyLog(r.GetSandboxConfig().GetMetadata().Namespace, r.GetSandboxConfig().GetMetadata().Name, fmt.Sprintf("%+v\n", r))
+			err = writePodExtractpolicyLog(r.GetSandboxConfig().GetMetadata().Namespace, r.GetSandboxConfig().GetMetadata().Name, "PullImage", r)
 			if err != nil {
 				log.G(ctx).Tracef("[extractpolicy][important][logerror]PullImage log failed: %s", err)
 			}
