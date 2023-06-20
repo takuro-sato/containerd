@@ -104,7 +104,7 @@ func (in *instrumentedAlphaService) checkInitialized() error {
 }
 
 func writePodExtractpolicyLog(namespace string, podname string, apiName string, request interface{}) error {
-	extractpolicyLogDir := "/var/log/extractpolicy"
+	extractpolicyLogDir := "/var/log/extract-cri-api"
 	logDir := filepath.Join(extractpolicyLogDir, namespace)
 	err := os.MkdirAll(logDir, 0777)
 	if err != nil && !os.IsExist(err) {
