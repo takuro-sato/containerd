@@ -151,7 +151,7 @@ func writeContainerExtractpolicyLog(containerID string, apiName string, request 
 	namespace := containerIdToNamespace[containerID]
 	podname := ContainerIdToPodName[containerID]
 	containerSpecHash := ContainerIdToContaienerSpecHash[containerID]
-	extractpolicyLogDir := "/var/log/extractpolicy"
+	extractpolicyLogDir := "/var/log/extract-cri-api"
 	logDir := filepath.Join(extractpolicyLogDir, namespace, podname)
 	err := os.MkdirAll(logDir, 0777)
 	if err != nil && !os.IsExist(err) {
@@ -1104,9 +1104,11 @@ func (in *instrumentedService) PullImage(ctx context.Context, r *runtime.PullIma
 		} else {
 			log.G(ctx).Infof("PullImage %q returns image reference %q",
 				r.GetImage().GetImage(), res.GetImageRef())
-			err = writePodExtractpolicyLog(r.GetSandboxConfig().GetMetadata().Namespace, r.GetSandboxConfig().GetMetadata().Name, "PullImage", r)
-			if err != nil {
-				log.G(ctx).Tracef("[extractpolicy][important][logerror]PullImage log failed: %s", err)
+			if r.GetSandboxConfig() != nil && r.GetSandboxConfig().GetMetadata() != nil {
+				err = writePodExtractpolicyLog(r.GetSandboxConfig().GetMetadata().Namespace, r.GetSandboxConfig().GetMetadata().Name, "PullImage", r)
+				if err != nil {
+					log.G(ctx).Tracef("[extractpolicy][important][logerror]PullImage log failed: %s", err)
+				}
 			}
 		}
 		span.SetStatus(err)
