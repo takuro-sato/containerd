@@ -131,6 +131,8 @@ func writePodExtractpolicyLog(namespace string, podname string, apiName string, 
 	return nil
 }
 
+// TODO: global variables look messy
+
 // ContainerIdToNamespace
 var containerIdToNamespace = make(map[string]string)
 
@@ -139,6 +141,16 @@ var ContainerIdToPodName = make(map[string]string)
 
 // ContainerIdToContaienrSpec
 var ContainerIdToContaienerSpecHash = make(map[string]string)
+
+var ContainerIdToContainerName = make(map[string]string)
+
+func podNameWithNamespace(namespace string, podName string) string {
+	return fmt.Sprintf("%s/%s", namespace, podName)
+}
+
+// TODO: thread safe?
+// TODO: many unused variables like this
+var podNameToContainerCounter = make(map[string]int)
 
 func calculateMD5Hash(input string) string {
 	hash := md5.New()
@@ -150,14 +162,16 @@ func calculateMD5Hash(input string) string {
 func writeContainerExtractpolicyLog(containerID string, apiName string, request interface{}) error {
 	namespace := containerIdToNamespace[containerID]
 	podname := ContainerIdToPodName[containerID]
-	containerSpecHash := ContainerIdToContaienerSpecHash[containerID]
+	// containerSpecHash := ContainerIdToContaienerSpecHash[containerID]
+	// containerName := podNameToContainerCounter[podNameWithNamespace(namespace, podname)]
+	containerName := ContainerIdToContainerName[containerID]
 	extractpolicyLogDir := "/var/log/extract-cri-api"
 	logDir := filepath.Join(extractpolicyLogDir, namespace, podname)
 	err := os.MkdirAll(logDir, 0777)
 	if err != nil && !os.IsExist(err) {
 		return err
 	}
-	filename := fmt.Sprintf("container-spec-%s.log", containerSpecHash)
+	filename := fmt.Sprintf("%s.log", containerName)
 	filepath := filepath.Join(logDir, filename)
 	file, err := os.OpenFile(filepath, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0666)
 	if err != nil {
@@ -523,8 +537,11 @@ func (in *instrumentedService) CreateContainer(ctx context.Context, r *runtime.C
 				r.GetPodSandboxId(), r.GetConfig().GetMetadata(), res.GetContainerId())
 			containerIdToNamespace[res.GetContainerId()] = r.GetSandboxConfig().GetMetadata().Namespace
 			ContainerIdToPodName[res.GetContainerId()] = r.GetSandboxConfig().GetMetadata().Name
+			ContainerIdToContainerName[res.GetContainerId()] = r.GetConfig().GetMetadata().Name
 			strContainerSpec := fmt.Sprintf("%+v", r.GetConfig())
+			// TODO: get rid of this variable
 			ContainerIdToContaienerSpecHash[res.GetContainerId()] = calculateMD5Hash(strContainerSpec)
+			podNameToContainerCounter[podNameWithNamespace(r.GetSandboxConfig().GetMetadata().Namespace, r.GetSandboxConfig().GetMetadata().Name)] += 1
 			err = writePodExtractpolicyLog(r.GetSandboxConfig().GetMetadata().Namespace, r.GetSandboxConfig().GetMetadata().Name, "CreateContainer", r)
 			if err != nil {
 				log.G(ctx).Tracef("[extractpolicy][important][logerror]CreateContainer log failed (pod): %s", err)
