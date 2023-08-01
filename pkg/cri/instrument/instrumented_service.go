@@ -139,7 +139,7 @@ var ContainerIdToContainerName = make(map[string]string)
 
 // We call <Pod name>_<Instance ID/counter starting from 0> as 'Pod name ID' here.
 var SandboxIdToPodNameId = make(map[string]string)
-var PodUidToSandboxId = make(map[string]string)
+var podUidToSandboxId = make(map[string]string)
 
 func writeContainerExtractpolicyLog(containerID string, apiName string, request interface{}) error {
 	namespace := containerIdToNamespace[containerID]
@@ -191,14 +191,7 @@ func (cm *Counter) Increment(name string) int {
 	return cm.counters[name]
 }
 
-var podInstanceIdCounter = NewCounter()
-
-func nextPodInstanceId(prefix string) int {
-	// minus one to make it 0-indexed
-	return podInstanceIdCounter.Increment(prefix) - 1
-}
-
-var sandboxIdToInstanceId = make(map[string]int)
+var sandboxIdToInstanceId = make(map[string]string)
 
 func podNameId(namespace string, podname string, sandboxId string) string {
 	if sandboxId == "" {
@@ -206,10 +199,11 @@ func podNameId(namespace string, podname string, sandboxId string) string {
 	}
 	instanceId, found := sandboxIdToInstanceId[sandboxId]
 	if !found {
-		instanceId = nextPodInstanceId(namespace + "/" + podname)
-		sandboxIdToInstanceId[sandboxId] = instanceId
+		// It should be found if you are adding "pod-instance-number" as an annotation.
+		// Use the original pod name if it's not found.
+		return podname
 	}
-	return fmt.Sprintf("%s_%d", podname, instanceId)
+	return fmt.Sprintf("%s_%s", podname, instanceId)
 }
 
 func (in *instrumentedService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandboxRequest) (res *runtime.RunPodSandboxResponse, err error) {
@@ -223,7 +217,12 @@ func (in *instrumentedService) RunPodSandbox(ctx context.Context, r *runtime.Run
 			log.G(ctx).WithError(err).Errorf("RunPodSandbox for %+v failed, error", r.GetConfig().GetMetadata())
 		} else {
 			log.G(ctx).Infof("RunPodSandbox for %+v returns sandbox id %q", r.GetConfig().GetMetadata(), res.GetPodSandboxId())
-			PodUidToSandboxId[r.GetConfig().GetMetadata().GetUid()] = res.GetPodSandboxId()
+			podUidToSandboxId[r.GetConfig().GetMetadata().GetUid()] = res.GetPodSandboxId()
+			annotations := r.GetConfig().GetAnnotations()
+			if instanceId, found := annotations["pod-instance-number"]; found {
+				sandboxIdToInstanceId[res.GetPodSandboxId()] = instanceId
+			}
+
 			err = writePodExtractpolicyLog(r.GetConfig().GetMetadata().Namespace, r.GetConfig().GetMetadata().Name, "RunPodSandbox", r, res.GetPodSandboxId())
 			if err != nil {
 				log.G(ctx).Tracef("[extractpolicy][important][logerror]RunPodSandbox log failed: %s", err)
@@ -1139,7 +1138,7 @@ func (in *instrumentedService) PullImage(ctx context.Context, r *runtime.PullIma
 			log.G(ctx).Infof("PullImage %q returns image reference %q",
 				r.GetImage().GetImage(), res.GetImageRef())
 			if r.GetSandboxConfig() != nil && r.GetSandboxConfig().GetMetadata() != nil {
-				sandboxId := PodUidToSandboxId[r.GetSandboxConfig().GetMetadata().GetUid()]
+				sandboxId := podUidToSandboxId[r.GetSandboxConfig().GetMetadata().GetUid()]
 				err = writePodExtractpolicyLog(r.GetSandboxConfig().GetMetadata().Namespace, r.GetSandboxConfig().GetMetadata().Name, "PullImage", r, sandboxId)
 				if err != nil {
 					log.G(ctx).Tracef("[extractpolicy][important][logerror]PullImage log failed: %s", err)
