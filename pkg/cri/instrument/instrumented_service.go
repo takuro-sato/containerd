@@ -18,13 +18,12 @@ package instrument
 
 import (
 	"context"
-	"crypto/md5"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/log"
@@ -103,14 +102,15 @@ func (in *instrumentedAlphaService) checkInitialized() error {
 	return errors.New("server is not initialized yet")
 }
 
-func writePodExtractpolicyLog(namespace string, podname string, apiName string, request interface{}) error {
+func writePodExtractpolicyLog(namespace string, podname string, apiName string, request interface{}, sandboxId string) error {
 	extractpolicyLogDir := "/var/log/extract-cri-api"
 	logDir := filepath.Join(extractpolicyLogDir, namespace)
 	err := os.MkdirAll(logDir, 0777)
 	if err != nil && !os.IsExist(err) {
 		return err
 	}
-	filename := fmt.Sprintf("%s.log", podname)
+	podNameId := podNameId(namespace, podname, sandboxId)
+	filename := fmt.Sprintf("%s.log", podNameId)
 	filepath := filepath.Join(logDir, filename)
 	file, err := os.OpenFile(filepath, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0666)
 	if err != nil {
@@ -133,40 +133,20 @@ func writePodExtractpolicyLog(namespace string, podname string, apiName string, 
 
 // TODO: global variables look messy
 
-// ContainerIdToNamespace
 var containerIdToNamespace = make(map[string]string)
-
-// ContainerIdToPodName
-var ContainerIdToPodName = make(map[string]string)
-
-// ContainerIdToContaienrSpec
-var ContainerIdToContaienerSpecHash = make(map[string]string)
-
+var ContainerIdToPodNameId = make(map[string]string)
 var ContainerIdToContainerName = make(map[string]string)
 
-func podNameWithNamespace(namespace string, podName string) string {
-	return fmt.Sprintf("%s/%s", namespace, podName)
-}
-
-// TODO: thread safe?
-// TODO: many unused variables like this
-var podNameToContainerCounter = make(map[string]int)
-
-func calculateMD5Hash(input string) string {
-	hash := md5.New()
-	hash.Write([]byte(input))
-	hashBytes := hash.Sum(nil)
-	return hex.EncodeToString(hashBytes)
-}
+// We call <Pod name>_<Instance ID/counter starting from 0> as 'Pod name ID' here.
+var SandboxIdToPodNameId = make(map[string]string)
+var PodUidToSandboxId = make(map[string]string)
 
 func writeContainerExtractpolicyLog(containerID string, apiName string, request interface{}) error {
 	namespace := containerIdToNamespace[containerID]
-	podname := ContainerIdToPodName[containerID]
-	// containerSpecHash := ContainerIdToContaienerSpecHash[containerID]
-	// containerName := podNameToContainerCounter[podNameWithNamespace(namespace, podname)]
+	podnameId := ContainerIdToPodNameId[containerID]
 	containerName := ContainerIdToContainerName[containerID]
 	extractpolicyLogDir := "/var/log/extract-cri-api"
-	logDir := filepath.Join(extractpolicyLogDir, namespace, podname)
+	logDir := filepath.Join(extractpolicyLogDir, namespace, podnameId)
 	err := os.MkdirAll(logDir, 0777)
 	if err != nil && !os.IsExist(err) {
 		return err
@@ -192,6 +172,46 @@ func writeContainerExtractpolicyLog(containerID string, apiName string, request 
 	return nil
 }
 
+type Counter struct {
+	counters map[string]int
+	mutex    sync.Mutex
+}
+
+func NewCounter() *Counter {
+	return &Counter{
+		counters: make(map[string]int),
+	}
+}
+
+func (cm *Counter) Increment(name string) int {
+	cm.mutex.Lock()
+	defer cm.mutex.Unlock()
+
+	cm.counters[name]++
+	return cm.counters[name]
+}
+
+var podInstanceIdCounter = NewCounter()
+
+func nextPodInstanceId(prefix string) int {
+	// minus one to make it 0-indexed
+	return podInstanceIdCounter.Increment(prefix) - 1
+}
+
+var sandboxIdToInstanceId = make(map[string]int)
+
+func podNameId(namespace string, podname string, sandboxId string) string {
+	if sandboxId == "" {
+		return podname
+	}
+	instanceId, found := sandboxIdToInstanceId[sandboxId]
+	if !found {
+		instanceId = nextPodInstanceId(namespace + "/" + podname)
+		sandboxIdToInstanceId[sandboxId] = instanceId
+	}
+	return fmt.Sprintf("%s_%d", podname, instanceId)
+}
+
 func (in *instrumentedService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandboxRequest) (res *runtime.RunPodSandboxResponse, err error) {
 	if err := in.checkInitialized(); err != nil {
 		return nil, err
@@ -203,7 +223,8 @@ func (in *instrumentedService) RunPodSandbox(ctx context.Context, r *runtime.Run
 			log.G(ctx).WithError(err).Errorf("RunPodSandbox for %+v failed, error", r.GetConfig().GetMetadata())
 		} else {
 			log.G(ctx).Infof("RunPodSandbox for %+v returns sandbox id %q", r.GetConfig().GetMetadata(), res.GetPodSandboxId())
-			err = writePodExtractpolicyLog(r.GetConfig().GetMetadata().Namespace, r.GetConfig().GetMetadata().Name, "RunPodSandbox", r)
+			PodUidToSandboxId[r.GetConfig().GetMetadata().GetUid()] = res.GetPodSandboxId()
+			err = writePodExtractpolicyLog(r.GetConfig().GetMetadata().Namespace, r.GetConfig().GetMetadata().Name, "RunPodSandbox", r, res.GetPodSandboxId())
 			if err != nil {
 				log.G(ctx).Tracef("[extractpolicy][important][logerror]RunPodSandbox log failed: %s", err)
 			}
@@ -536,13 +557,9 @@ func (in *instrumentedService) CreateContainer(ctx context.Context, r *runtime.C
 			log.G(ctx).Infof("CreateContainer within sandbox %q for %+v returns container id %q",
 				r.GetPodSandboxId(), r.GetConfig().GetMetadata(), res.GetContainerId())
 			containerIdToNamespace[res.GetContainerId()] = r.GetSandboxConfig().GetMetadata().Namespace
-			ContainerIdToPodName[res.GetContainerId()] = r.GetSandboxConfig().GetMetadata().Name
+			ContainerIdToPodNameId[res.GetContainerId()] = podNameId(r.GetSandboxConfig().GetMetadata().Namespace, r.GetSandboxConfig().GetMetadata().Name, r.GetPodSandboxId())
 			ContainerIdToContainerName[res.GetContainerId()] = r.GetConfig().GetMetadata().Name
-			strContainerSpec := fmt.Sprintf("%+v", r.GetConfig())
-			// TODO: get rid of this variable
-			ContainerIdToContaienerSpecHash[res.GetContainerId()] = calculateMD5Hash(strContainerSpec)
-			podNameToContainerCounter[podNameWithNamespace(r.GetSandboxConfig().GetMetadata().Namespace, r.GetSandboxConfig().GetMetadata().Name)] += 1
-			err = writePodExtractpolicyLog(r.GetSandboxConfig().GetMetadata().Namespace, r.GetSandboxConfig().GetMetadata().Name, "CreateContainer", r)
+			err = writePodExtractpolicyLog(r.GetSandboxConfig().GetMetadata().Namespace, r.GetSandboxConfig().GetMetadata().Name, "CreateContainer", r, r.GetPodSandboxId())
 			if err != nil {
 				log.G(ctx).Tracef("[extractpolicy][important][logerror]CreateContainer log failed (pod): %s", err)
 			}
@@ -1122,7 +1139,8 @@ func (in *instrumentedService) PullImage(ctx context.Context, r *runtime.PullIma
 			log.G(ctx).Infof("PullImage %q returns image reference %q",
 				r.GetImage().GetImage(), res.GetImageRef())
 			if r.GetSandboxConfig() != nil && r.GetSandboxConfig().GetMetadata() != nil {
-				err = writePodExtractpolicyLog(r.GetSandboxConfig().GetMetadata().Namespace, r.GetSandboxConfig().GetMetadata().Name, "PullImage", r)
+				sandboxId := PodUidToSandboxId[r.GetSandboxConfig().GetMetadata().GetUid()]
+				err = writePodExtractpolicyLog(r.GetSandboxConfig().GetMetadata().Namespace, r.GetSandboxConfig().GetMetadata().Name, "PullImage", r, sandboxId)
 				if err != nil {
 					log.G(ctx).Tracef("[extractpolicy][important][logerror]PullImage log failed: %s", err)
 				}
