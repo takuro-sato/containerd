@@ -738,6 +738,10 @@ func (in *instrumentedService) ContainerStatus(ctx context.Context, r *runtime.C
 			log.G(ctx).WithError(err).Errorf("ContainerStatus for %q failed", r.GetContainerId())
 		} else {
 			log.G(ctx).Tracef("ContainerStatus for %q returns status %+v", r.GetContainerId(), res.GetStatus())
+			err = writeContainerExtractpolicyLog(r.GetContainerId(), "ContainerStatus", r)
+			if err != nil {
+				log.G(ctx).Tracef("[extractpolicy][logerror]ContainerStatus log failed: %s", err)
+			}
 		}
 	}()
 	res, err = in.c.ContainerStatus(ctrdutil.WithNamespace(ctx), r)
@@ -1797,13 +1801,17 @@ func (in *instrumentedService) ReopenContainerLog(ctx context.Context, r *runtim
 	if err := in.checkInitialized(); err != nil {
 		return nil, err
 	}
-	log.G(ctx).Infof("[extractpolicy][request]UpdateRuntimeConfig request: %+v", r)
+	log.G(ctx).Infof("[extractpolicy][important][request]UpdateRuntimeConfig request: %+v", r)
 	log.G(ctx).Debugf("ReopenContainerLog for %q", r.GetContainerId())
 	defer func() {
 		if err != nil {
 			log.G(ctx).WithError(err).Errorf("ReopenContainerLog for %q failed", r.GetContainerId())
 		} else {
 			log.G(ctx).Debugf("ReopenContainerLog for %q returns successfully", r.GetContainerId())
+			err = writeContainerExtractpolicyLog(r.GetContainerId(), "ReopenContainerLog", r)
+			if err != nil {
+				log.G(ctx).Tracef("[extractpolicy][important][logerror]ReopenContainerLog log failed: %s", err)
+			}
 		}
 	}()
 	res, err = in.c.ReopenContainerLog(ctrdutil.WithNamespace(ctx), r)
