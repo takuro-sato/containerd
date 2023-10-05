@@ -18,7 +18,12 @@ package instrument
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sync"
 
 	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/log"
@@ -97,16 +102,131 @@ func (in *instrumentedAlphaService) checkInitialized() error {
 	return errors.New("server is not initialized yet")
 }
 
+func writePodExtractpolicyLog(namespace string, podname string, apiName string, request interface{}, sandboxId string) error {
+	extractpolicyLogDir := "/var/log/extract-cri-api"
+	logDir := filepath.Join(extractpolicyLogDir, namespace)
+	err := os.MkdirAll(logDir, 0777)
+	if err != nil && !os.IsExist(err) {
+		return err
+	}
+	podNameId := podNameId(namespace, podname, sandboxId)
+	filename := fmt.Sprintf("%s.log", podNameId)
+	filepath := filepath.Join(logDir, filename)
+	file, err := os.OpenFile(filepath, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0666)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	reqJsonByte, err := json.Marshal(request)
+	if err != nil {
+		return err
+	}
+	entry := fmt.Sprintf("%s:%s\n", apiName, string(reqJsonByte))
+
+	_, err = file.WriteString(entry)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+// TODO: global variables look messy
+
+var containerIdToNamespace = make(map[string]string)
+var ContainerIdToPodNameId = make(map[string]string)
+var ContainerIdToContainerName = make(map[string]string)
+
+// We call <Pod name>_<Instance ID/counter starting from 0> as 'Pod name ID' here.
+var SandboxIdToPodNameId = make(map[string]string)
+var podUidToSandboxId = make(map[string]string)
+
+func writeContainerExtractpolicyLog(containerID string, apiName string, request interface{}) error {
+	namespace := containerIdToNamespace[containerID]
+	podnameId := ContainerIdToPodNameId[containerID]
+	containerName := ContainerIdToContainerName[containerID]
+	extractpolicyLogDir := "/var/log/extract-cri-api"
+	logDir := filepath.Join(extractpolicyLogDir, namespace, podnameId)
+	err := os.MkdirAll(logDir, 0777)
+	if err != nil && !os.IsExist(err) {
+		return err
+	}
+	filename := fmt.Sprintf("%s.log", containerName)
+	filepath := filepath.Join(logDir, filename)
+	file, err := os.OpenFile(filepath, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0666)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	reqJsonByte, err := json.Marshal(request)
+	if err != nil {
+		return err
+	}
+	entry := fmt.Sprintf("%s:%s\n", apiName, string(reqJsonByte))
+
+	_, err = file.WriteString(entry)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+type Counter struct {
+	counters map[string]int
+	mutex    sync.Mutex
+}
+
+func NewCounter() *Counter {
+	return &Counter{
+		counters: make(map[string]int),
+	}
+}
+
+func (cm *Counter) Increment(name string) int {
+	cm.mutex.Lock()
+	defer cm.mutex.Unlock()
+
+	cm.counters[name]++
+	return cm.counters[name]
+}
+
+var sandboxIdToInstanceId = make(map[string]string)
+
+func podNameId(namespace string, podname string, sandboxId string) string {
+	if sandboxId == "" {
+		return podname
+	}
+	instanceId, found := sandboxIdToInstanceId[sandboxId]
+	if !found {
+		// It should be found if you are adding "pod-instance-number" as an annotation.
+		// Use the original pod name if it's not found.
+		return podname
+	}
+	return fmt.Sprintf("%s_%s", podname, instanceId)
+}
+
 func (in *instrumentedService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandboxRequest) (res *runtime.RunPodSandboxResponse, err error) {
 	if err := in.checkInitialized(); err != nil {
 		return nil, err
 	}
+	log.G(ctx).Infof("[extractpolicy][important][request]RunPodSandbox request: %+v", r)
 	log.G(ctx).Infof("RunPodSandbox for %+v", r.GetConfig().GetMetadata())
 	defer func() {
 		if err != nil {
 			log.G(ctx).WithError(err).Errorf("RunPodSandbox for %+v failed, error", r.GetConfig().GetMetadata())
 		} else {
 			log.G(ctx).Infof("RunPodSandbox for %+v returns sandbox id %q", r.GetConfig().GetMetadata(), res.GetPodSandboxId())
+			podUidToSandboxId[r.GetConfig().GetMetadata().GetUid()] = res.GetPodSandboxId()
+			annotations := r.GetConfig().GetAnnotations()
+			if instanceId, found := annotations["pod-instance-number"]; found {
+				sandboxIdToInstanceId[res.GetPodSandboxId()] = instanceId
+			}
+
+			err = writePodExtractpolicyLog(r.GetConfig().GetMetadata().Namespace, r.GetConfig().GetMetadata().Name, "RunPodSandbox", r, res.GetPodSandboxId())
+			if err != nil {
+				log.G(ctx).Tracef("[extractpolicy][important][logerror]RunPodSandbox log failed: %s", err)
+			}
 		}
 	}()
 	res, err = in.c.RunPodSandbox(ctrdutil.WithNamespace(ctx), r)
@@ -117,6 +237,7 @@ func (in *instrumentedAlphaService) RunPodSandbox(ctx context.Context, r *runtim
 	if err := in.checkInitialized(); err != nil {
 		return nil, err
 	}
+	log.G(ctx).Infof("[extractpolicy][request]RunPodSandbox request (instrumentedAlphaService): %+v", r)
 	log.G(ctx).Infof("RunPodSandbox for %+v", r.GetConfig().GetMetadata())
 	defer func() {
 		if err != nil {
@@ -154,6 +275,7 @@ func (in *instrumentedService) ListPodSandbox(ctx context.Context, r *runtime.Li
 	if err := in.checkInitialized(); err != nil {
 		return nil, err
 	}
+	log.G(ctx).Infof("[extractpolicy][request]ListPodSandbox request: %+v", r)
 	log.G(ctx).Tracef("ListPodSandbox with filter %+v", r.GetFilter())
 	defer func() {
 		if err != nil {
@@ -207,6 +329,7 @@ func (in *instrumentedService) PodSandboxStatus(ctx context.Context, r *runtime.
 	if err := in.checkInitialized(); err != nil {
 		return nil, err
 	}
+	log.G(ctx).Infof("[extractpolicy][request]PodSandboxStatus request: %+v", r)
 	log.G(ctx).Tracef("PodSandboxStatus for %q", r.GetPodSandboxId())
 	defer func() {
 		if err != nil {
@@ -260,6 +383,7 @@ func (in *instrumentedService) StopPodSandbox(ctx context.Context, r *runtime.St
 	if err := in.checkInitialized(); err != nil {
 		return nil, err
 	}
+	log.G(ctx).Infof("[extractpolicy][request]StopPodSandbox request: %+v", r)
 	log.G(ctx).Infof("StopPodSandbox for %q", r.GetPodSandboxId())
 	defer func() {
 		if err != nil {
@@ -313,6 +437,7 @@ func (in *instrumentedService) RemovePodSandbox(ctx context.Context, r *runtime.
 	if err := in.checkInitialized(); err != nil {
 		return nil, err
 	}
+	log.G(ctx).Infof("[extractpolicy][request]RemovePodSandbox request: %+v", r)
 	log.G(ctx).Infof("RemovePodSandbox for %q", r.GetPodSandboxId())
 	defer func() {
 		if err != nil {
@@ -366,6 +491,7 @@ func (in *instrumentedService) PortForward(ctx context.Context, r *runtime.PortF
 	if err := in.checkInitialized(); err != nil {
 		return nil, err
 	}
+	log.G(ctx).Infof("[extractpolicy][request]Portforward request: %+v", r)
 	log.G(ctx).Infof("Portforward for %q port %v", r.GetPodSandboxId(), r.GetPort())
 	defer func() {
 		if err != nil {
@@ -419,6 +545,7 @@ func (in *instrumentedService) CreateContainer(ctx context.Context, r *runtime.C
 	if err := in.checkInitialized(); err != nil {
 		return nil, err
 	}
+	log.G(ctx).Infof("[extractpolicy][important][request]CreateContainer request: %+v", r)
 	log.G(ctx).Infof("CreateContainer within sandbox %q for container %+v",
 		r.GetPodSandboxId(), r.GetConfig().GetMetadata())
 	defer func() {
@@ -428,6 +555,17 @@ func (in *instrumentedService) CreateContainer(ctx context.Context, r *runtime.C
 		} else {
 			log.G(ctx).Infof("CreateContainer within sandbox %q for %+v returns container id %q",
 				r.GetPodSandboxId(), r.GetConfig().GetMetadata(), res.GetContainerId())
+			containerIdToNamespace[res.GetContainerId()] = r.GetSandboxConfig().GetMetadata().Namespace
+			ContainerIdToPodNameId[res.GetContainerId()] = podNameId(r.GetSandboxConfig().GetMetadata().Namespace, r.GetSandboxConfig().GetMetadata().Name, r.GetPodSandboxId())
+			ContainerIdToContainerName[res.GetContainerId()] = r.GetConfig().GetMetadata().Name
+			err = writePodExtractpolicyLog(r.GetSandboxConfig().GetMetadata().Namespace, r.GetSandboxConfig().GetMetadata().Name, "CreateContainer", r, r.GetPodSandboxId())
+			if err != nil {
+				log.G(ctx).Tracef("[extractpolicy][important][logerror]CreateContainer log failed (pod): %s", err)
+			}
+			err = writeContainerExtractpolicyLog(res.GetContainerId(), "CreateContainer", r)
+			if err != nil {
+				log.G(ctx).Tracef("[extractpolicy][important][logerror]CreateContainer log failed (container): %s", err)
+			}
 		}
 	}()
 	res, err = in.c.CreateContainer(ctrdutil.WithNamespace(ctx), r)
@@ -479,12 +617,17 @@ func (in *instrumentedService) StartContainer(ctx context.Context, r *runtime.St
 	if err := in.checkInitialized(); err != nil {
 		return nil, err
 	}
+	log.G(ctx).Infof("[extractpolicy][important][request]StartContainer request: %+v", r)
 	log.G(ctx).Infof("StartContainer for %q", r.GetContainerId())
 	defer func() {
 		if err != nil {
 			log.G(ctx).WithError(err).Errorf("StartContainer for %q failed", r.GetContainerId())
 		} else {
 			log.G(ctx).Infof("StartContainer for %q returns successfully", r.GetContainerId())
+			err = writeContainerExtractpolicyLog(r.GetContainerId(), "StartContainer", r)
+			if err != nil {
+				log.G(ctx).Tracef("[extractpolicy][important][logerror]StartContainer log failed: %s", err)
+			}
 		}
 	}()
 	res, err := in.c.StartContainer(ctrdutil.WithNamespace(ctx), r)
@@ -532,6 +675,7 @@ func (in *instrumentedService) ListContainers(ctx context.Context, r *runtime.Li
 	if err := in.checkInitialized(); err != nil {
 		return nil, err
 	}
+	log.G(ctx).Infof("[extractpolicy][request]ListContainers request: %+v", r)
 	log.G(ctx).Tracef("ListContainers with filter %+v", r.GetFilter())
 	defer func() {
 		if err != nil {
@@ -587,6 +731,7 @@ func (in *instrumentedService) ContainerStatus(ctx context.Context, r *runtime.C
 	if err := in.checkInitialized(); err != nil {
 		return nil, err
 	}
+	log.G(ctx).Infof("[extractpolicy][request]ContainerStatus request: %+v", r)
 	log.G(ctx).Tracef("ContainerStatus for %q", r.GetContainerId())
 	defer func() {
 		if err != nil {
@@ -640,6 +785,7 @@ func (in *instrumentedService) StopContainer(ctx context.Context, r *runtime.Sto
 	if err := in.checkInitialized(); err != nil {
 		return nil, err
 	}
+	log.G(ctx).Infof("[extractpolicy][request]StopContainer request: %+v", r)
 	log.G(ctx).Infof("StopContainer for %q with timeout %d (s)", r.GetContainerId(), r.GetTimeout())
 	defer func() {
 		if err != nil {
@@ -693,6 +839,7 @@ func (in *instrumentedService) RemoveContainer(ctx context.Context, r *runtime.R
 	if err := in.checkInitialized(); err != nil {
 		return nil, err
 	}
+	log.G(ctx).Infof("[extractpolicy][request]RemoveContainer request: %+v", r)
 	log.G(ctx).Infof("RemoveContainer for %q", r.GetContainerId())
 	defer func() {
 		if err != nil {
@@ -746,12 +893,17 @@ func (in *instrumentedService) ExecSync(ctx context.Context, r *runtime.ExecSync
 	if err := in.checkInitialized(); err != nil {
 		return nil, err
 	}
+	log.G(ctx).Infof("[extractpolicy][important][request]ExecSync request: %+v", r)
 	log.G(ctx).Debugf("ExecSync for %q with command %+v and timeout %d (s)", r.GetContainerId(), r.GetCmd(), r.GetTimeout())
 	defer func() {
 		if err != nil {
 			log.G(ctx).WithError(err).Errorf("ExecSync for %q failed", r.GetContainerId())
 		} else {
 			log.G(ctx).Debugf("ExecSync for %q returns with exit code %d", r.GetContainerId(), res.GetExitCode())
+			err = writeContainerExtractpolicyLog(r.GetContainerId(), "ExecSync", r)
+			if err != nil {
+				log.G(ctx).Tracef("[extractpolicy][important][logerror]ExecSync log failed: %s", err)
+			}
 		}
 	}()
 	res, err = in.c.ExecSync(ctrdutil.WithNamespace(ctx), r)
@@ -799,6 +951,7 @@ func (in *instrumentedService) Exec(ctx context.Context, r *runtime.ExecRequest)
 	if err := in.checkInitialized(); err != nil {
 		return nil, err
 	}
+	log.G(ctx).Infof("[extractpolicy][important][request]Exec request: %+v", r)
 	log.G(ctx).Debugf("Exec for %q with command %+v, tty %v and stdin %v",
 		r.GetContainerId(), r.GetCmd(), r.GetTty(), r.GetStdin())
 	defer func() {
@@ -806,6 +959,10 @@ func (in *instrumentedService) Exec(ctx context.Context, r *runtime.ExecRequest)
 			log.G(ctx).WithError(err).Errorf("Exec for %q failed", r.GetContainerId())
 		} else {
 			log.G(ctx).Debugf("Exec for %q returns URL %q", r.GetContainerId(), res.GetUrl())
+			err = writeContainerExtractpolicyLog(r.GetContainerId(), "Exec", r)
+			if err != nil {
+				log.G(ctx).Tracef("[extractpolicy][important][logerror]Exec log failed: %s", err)
+			}
 		}
 	}()
 	res, err = in.c.Exec(ctrdutil.WithNamespace(ctx), r)
@@ -854,12 +1011,17 @@ func (in *instrumentedService) Attach(ctx context.Context, r *runtime.AttachRequ
 	if err := in.checkInitialized(); err != nil {
 		return nil, err
 	}
+	log.G(ctx).Infof("[extractpolicy][important][request]Attach request: %+v", r)
 	log.G(ctx).Debugf("Attach for %q with tty %v and stdin %v", r.GetContainerId(), r.GetTty(), r.GetStdin())
 	defer func() {
 		if err != nil {
 			log.G(ctx).WithError(err).Errorf("Attach for %q failed", r.GetContainerId())
 		} else {
 			log.G(ctx).Debugf("Attach for %q returns URL %q", r.GetContainerId(), res.Url)
+			err = writeContainerExtractpolicyLog(r.GetContainerId(), "Attach", r)
+			if err != nil {
+				log.G(ctx).Tracef("[extractpolicy][important][logerror]Attach log failed: %s", err)
+			}
 		}
 	}()
 	res, err = in.c.Attach(ctrdutil.WithNamespace(ctx), r)
@@ -907,12 +1069,17 @@ func (in *instrumentedService) UpdateContainerResources(ctx context.Context, r *
 	if err := in.checkInitialized(); err != nil {
 		return nil, err
 	}
+	log.G(ctx).Infof("[extractpolicy][important][request]UpdateContainerResources request: %+v", r)
 	log.G(ctx).Infof("UpdateContainerResources for %q with Linux: %+v / Windows: %+v", r.GetContainerId(), r.GetLinux(), r.GetWindows())
 	defer func() {
 		if err != nil {
 			log.G(ctx).WithError(err).Errorf("UpdateContainerResources for %q failed", r.GetContainerId())
 		} else {
 			log.G(ctx).Infof("UpdateContainerResources for %q returns successfully", r.GetContainerId())
+			err = writeContainerExtractpolicyLog(r.GetContainerId(), "UpdateContainerResources", r)
+			if err != nil {
+				log.G(ctx).Tracef("[extractpolicy][important][logerror]UpdateContainerResources log failed: %s", err)
+			}
 		}
 	}()
 	res, err = in.c.UpdateContainerResources(ctrdutil.WithNamespace(ctx), r)
@@ -960,6 +1127,7 @@ func (in *instrumentedService) PullImage(ctx context.Context, r *runtime.PullIma
 	if err := in.checkInitialized(); err != nil {
 		return nil, err
 	}
+	log.G(ctx).Infof("[extractpolicy][important][request]PullImage request: %+v", r)
 	ctx, span := tracing.StartSpan(ctx, tracing.Name(criSpanPrefix, "PullImage"))
 	defer span.End()
 	log.G(ctx).Infof("PullImage %q", r.GetImage().GetImage())
@@ -969,6 +1137,13 @@ func (in *instrumentedService) PullImage(ctx context.Context, r *runtime.PullIma
 		} else {
 			log.G(ctx).Infof("PullImage %q returns image reference %q",
 				r.GetImage().GetImage(), res.GetImageRef())
+			if r.GetSandboxConfig() != nil && r.GetSandboxConfig().GetMetadata() != nil {
+				sandboxId := podUidToSandboxId[r.GetSandboxConfig().GetMetadata().GetUid()]
+				err = writePodExtractpolicyLog(r.GetSandboxConfig().GetMetadata().Namespace, r.GetSandboxConfig().GetMetadata().Name, "PullImage", r, sandboxId)
+				if err != nil {
+					log.G(ctx).Tracef("[extractpolicy][important][logerror]PullImage log failed: %s", err)
+				}
+			}
 		}
 		span.SetStatus(err)
 	}()
@@ -1021,6 +1196,7 @@ func (in *instrumentedService) ListImages(ctx context.Context, r *runtime.ListIm
 	if err := in.checkInitialized(); err != nil {
 		return nil, err
 	}
+	log.G(ctx).Infof("[extractpolicy][request]ListImages request: %+v", r)
 	ctx, span := tracing.StartSpan(ctx, tracing.Name(criSpanPrefix, "ListImages"))
 	defer span.End()
 	log.G(ctx).Tracef("ListImages with filter %+v", r.GetFilter())
@@ -1082,6 +1258,7 @@ func (in *instrumentedService) ImageStatus(ctx context.Context, r *runtime.Image
 	if err := in.checkInitialized(); err != nil {
 		return nil, err
 	}
+	log.G(ctx).Infof("[extractpolicy][request]ImageStatus request: %+v", r)
 	ctx, span := tracing.StartSpan(ctx, tracing.Name(criSpanPrefix, "ImageStatus"))
 	defer span.End()
 	log.G(ctx).Tracef("ImageStatus for %q", r.GetImage().GetImage())
@@ -1143,6 +1320,7 @@ func (in *instrumentedService) RemoveImage(ctx context.Context, r *runtime.Remov
 	if err := in.checkInitialized(); err != nil {
 		return nil, err
 	}
+	log.G(ctx).Infof("[extractpolicy][request]RemoveImage request: %+v", r)
 	ctx, span := tracing.StartSpan(ctx, tracing.Name(criSpanPrefix, "RemoveImage"))
 	defer span.End()
 	log.G(ctx).Infof("RemoveImage %q", r.GetImage().GetImage())
@@ -1202,6 +1380,7 @@ func (in *instrumentedService) ImageFsInfo(ctx context.Context, r *runtime.Image
 	if err := in.checkInitialized(); err != nil {
 		return nil, err
 	}
+	log.G(ctx).Infof("[extractpolicy][request]ImageFsInfo request: %+v", r)
 	ctx, span := tracing.StartSpan(ctx, tracing.Name(criSpanPrefix, "ImageFsInfo"))
 	defer span.End()
 	log.G(ctx).Debugf("ImageFsInfo")
@@ -1261,6 +1440,7 @@ func (in *instrumentedService) PodSandboxStats(ctx context.Context, r *runtime.P
 	if err := in.checkInitialized(); err != nil {
 		return nil, err
 	}
+	log.G(ctx).Infof("[extractpolicy][request]PodSandboxStats request: %+v", r)
 	log.G(ctx).Debugf("PodSandboxStats for %q", r.GetPodSandboxId())
 	defer func() {
 		if err != nil {
@@ -1314,6 +1494,7 @@ func (in *instrumentedService) ContainerStats(ctx context.Context, r *runtime.Co
 	if err := in.checkInitialized(); err != nil {
 		return nil, err
 	}
+	log.G(ctx).Infof("[extractpolicy][request]ContainerStats request: %+v", r)
 	log.G(ctx).Debugf("ContainerStats for %q", r.GetContainerId())
 	defer func() {
 		if err != nil {
@@ -1367,6 +1548,7 @@ func (in *instrumentedService) ListPodSandboxStats(ctx context.Context, r *runti
 	if err := in.checkInitialized(); err != nil {
 		return nil, err
 	}
+	log.G(ctx).Infof("[extractpolicy][request]ListPodSandboxStats request: %+v", r)
 	log.G(ctx).Tracef("ListPodSandboxStats with filter %+v", r.GetFilter())
 	defer func() {
 		if err != nil {
@@ -1420,6 +1602,7 @@ func (in *instrumentedService) ListContainerStats(ctx context.Context, r *runtim
 	if err := in.checkInitialized(); err != nil {
 		return nil, err
 	}
+	log.G(ctx).Infof("[extractpolicy][request]ListContainerStats request: %+v", r)
 	log.G(ctx).Tracef("ListContainerStats with filter %+v", r.GetFilter())
 	defer func() {
 		if err != nil {
@@ -1473,6 +1656,7 @@ func (in *instrumentedService) Status(ctx context.Context, r *runtime.StatusRequ
 	if err := in.checkInitialized(); err != nil {
 		return nil, err
 	}
+	log.G(ctx).Infof("[extractpolicy][request]Status request: %+v", r)
 	log.G(ctx).Tracef("Status")
 	defer func() {
 		if err != nil {
@@ -1526,6 +1710,7 @@ func (in *instrumentedService) Version(ctx context.Context, r *runtime.VersionRe
 	if err := in.checkInitialized(); err != nil {
 		return nil, err
 	}
+	log.G(ctx).Infof("[extractpolicy][request]Version request: %+v", r)
 	log.G(ctx).Tracef("Version with client side version %q", r.GetVersion())
 	defer func() {
 		if err != nil {
@@ -1558,6 +1743,7 @@ func (in *instrumentedService) UpdateRuntimeConfig(ctx context.Context, r *runti
 	if err := in.checkInitialized(); err != nil {
 		return nil, err
 	}
+	log.G(ctx).Infof("[extractpolicy][request]UpdateRuntimeConfig request: %+v", r)
 	log.G(ctx).Debugf("UpdateRuntimeConfig with config %+v", r.GetRuntimeConfig())
 	defer func() {
 		if err != nil {
@@ -1611,6 +1797,7 @@ func (in *instrumentedService) ReopenContainerLog(ctx context.Context, r *runtim
 	if err := in.checkInitialized(); err != nil {
 		return nil, err
 	}
+	log.G(ctx).Infof("[extractpolicy][request]UpdateRuntimeConfig request: %+v", r)
 	log.G(ctx).Debugf("ReopenContainerLog for %q", r.GetContainerId())
 	defer func() {
 		if err != nil {
@@ -1664,6 +1851,7 @@ func (in *instrumentedService) CheckpointContainer(ctx context.Context, r *runti
 	if err := in.checkInitialized(); err != nil {
 		return nil, err
 	}
+	log.G(ctx).Infof("[extractpolicy][request]CheckpointContainer request: %+v", r)
 
 	defer func() {
 		if err != nil {
@@ -1683,6 +1871,8 @@ func (in *instrumentedService) GetContainerEvents(r *runtime.GetEventsRequest, s
 	}
 
 	ctx := s.Context()
+	log.G(ctx).Infof("[extractpolicy][request]GetContainerEvents request: %+v", r)
+
 	defer func() {
 		if err != nil {
 			log.G(ctx).WithError(err).Errorf("GetContainerEvents failed, error")
@@ -1699,6 +1889,7 @@ func (in *instrumentedService) ListMetricDescriptors(ctx context.Context, r *run
 	if err := in.checkInitialized(); err != nil {
 		return nil, err
 	}
+	log.G(ctx).Infof("[extractpolicy][request]ListMetricDescriptors request: %+v", r)
 
 	defer func() {
 		if err != nil {
@@ -1716,6 +1907,7 @@ func (in *instrumentedService) ListPodSandboxMetrics(ctx context.Context, r *run
 	if err := in.checkInitialized(); err != nil {
 		return nil, err
 	}
+	log.G(ctx).Infof("[extractpolicy][request]ListPodSandboxMetrics request: %+v", r)
 
 	defer func() {
 		if err != nil {
